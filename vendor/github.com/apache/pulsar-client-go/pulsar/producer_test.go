@@ -20,12 +20,12 @@ package pulsar
 import (
 	"context"
 	"fmt"
+	"github.com/apache/pulsar-client-go/pulsar/internal"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/apache/pulsar-client-go/util"
 	"github.com/stretchr/testify/assert"
 
 	log "github.com/sirupsen/logrus"
@@ -85,6 +85,7 @@ func TestSimpleProducer(t *testing.T) {
 		URL: serviceURL,
 	})
 	assert.NoError(t, err)
+	defer client.Close()
 
 	producer, err := client.CreateProducer(ProducerOptions{
 		Topic: newTopicName(),
@@ -92,6 +93,7 @@ func TestSimpleProducer(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
+	defer producer.Close()
 
 	for i := 0; i < 10; i++ {
 		err = producer.Send(context.Background(), &ProducerMessage{
@@ -100,12 +102,6 @@ func TestSimpleProducer(t *testing.T) {
 
 		assert.NoError(t, err)
 	}
-
-	err = producer.Close()
-	assert.NoError(t, err)
-
-	err = client.Close()
-	assert.NoError(t, err)
 }
 
 func TestProducerAsyncSend(t *testing.T) {
@@ -113,6 +109,7 @@ func TestProducerAsyncSend(t *testing.T) {
 		URL: serviceURL,
 	})
 	assert.NoError(t, err)
+	defer client.Close()
 
 	producer, err := client.CreateProducer(ProducerOptions{
 		Topic:                   newTopicName(),
@@ -121,10 +118,11 @@ func TestProducerAsyncSend(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
+	defer producer.Close()
 
 	wg := sync.WaitGroup{}
 	wg.Add(10)
-	errors := util.NewBlockingQueue(10)
+	errors := internal.NewBlockingQueue(10)
 
 	for i := 0; i < 10; i++ {
 		producer.SendAsync(context.Background(), &ProducerMessage{
@@ -148,12 +146,6 @@ func TestProducerAsyncSend(t *testing.T) {
 	wg.Wait()
 
 	assert.Equal(t, 0, errors.Size())
-
-	err = producer.Close()
-	assert.NoError(t, err)
-
-	err = client.Close()
-	assert.NoError(t, err)
 }
 
 func TestProducerCompression(t *testing.T) {
@@ -176,6 +168,7 @@ func TestProducerCompression(t *testing.T) {
 				URL: serviceURL,
 			})
 			assert.NoError(t, err)
+			defer client.Close()
 
 			producer, err := client.CreateProducer(ProducerOptions{
 				Topic:           newTopicName(),
@@ -184,6 +177,7 @@ func TestProducerCompression(t *testing.T) {
 
 			assert.NoError(t, err)
 			assert.NotNil(t, producer)
+			defer producer.Close()
 
 			for i := 0; i < 10; i++ {
 				err = producer.Send(context.Background(), &ProducerMessage{
@@ -192,12 +186,6 @@ func TestProducerCompression(t *testing.T) {
 
 				assert.NoError(t, err)
 			}
-
-			err = producer.Close()
-			assert.NoError(t, err)
-
-			err = client.Close()
-			assert.NoError(t, err)
 		})
 	}
 }
@@ -207,6 +195,7 @@ func TestProducerLastSequenceID(t *testing.T) {
 		URL: serviceURL,
 	})
 	assert.NoError(t, err)
+	defer client.Close()
 
 	producer, err := client.CreateProducer(ProducerOptions{
 		Topic: newTopicName(),
@@ -214,6 +203,7 @@ func TestProducerLastSequenceID(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, producer)
+	defer producer.Close()
 
 	assert.Equal(t, int64(-1), producer.LastSequenceID())
 
@@ -225,12 +215,6 @@ func TestProducerLastSequenceID(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, int64(i), producer.LastSequenceID())
 	}
-
-	err = producer.Close()
-	assert.NoError(t, err)
-
-	err = client.Close()
-	assert.NoError(t, err)
 }
 
 func TestEventTime(t *testing.T) {
@@ -306,7 +290,7 @@ func TestFlushInProducer(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 	wg.Add(5)
-	errors := util.NewBlockingQueue(10)
+	errors := internal.NewBlockingQueue(10)
 	for i := 0; i < numOfMessages/2; i++ {
 		messageContent := prefix + fmt.Sprintf("%d", i)
 		producer.SendAsync(ctx, &ProducerMessage{
@@ -404,7 +388,7 @@ func TestFlushInPartitionedProducer(t *testing.T) {
 	prefix := "msg-batch-async-"
 	wg := sync.WaitGroup{}
 	wg.Add(5)
-	errors := util.NewBlockingQueue(5)
+	errors := internal.NewBlockingQueue(5)
 	for i := 0; i < numOfMessages/2; i++ {
 		messageContent := prefix + fmt.Sprintf("%d", i)
 		producer.SendAsync(ctx, &ProducerMessage{
@@ -434,8 +418,7 @@ func TestFlushInPartitionedProducer(t *testing.T) {
 		fmt.Printf("Received message msgId: %#v -- content: '%s'\n",
 			msg.ID(), string(msg.Payload()))
 		assert.Nil(t, err)
-		err = consumer.Ack(msg)
-		assert.Nil(t, err)
+		consumer.Ack(msg)
 		msgCount++
 	}
 	assert.Equal(t, msgCount, numOfMessages/2)
@@ -443,7 +426,10 @@ func TestFlushInPartitionedProducer(t *testing.T) {
 
 func TestMessageRouter(t *testing.T) {
 	// Create topic with 5 partitions
-	httpPut("http://localhost:8080/admin/v2/persistent/public/default/my-partitioned-topic/partitions", 5)
+	err := httpPut("admin/v2/persistent/public/default/my-partitioned-topic/partitions", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client, err := NewClient(ClientOptions{
 		URL: serviceURL,
 	})
@@ -508,4 +494,67 @@ func TestNonPersistentTopic(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	defer consumer.Close()
+}
+
+func TestProducerDuplicateNameOnSameTopic(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: serviceURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	topicName := newTopicName()
+	producerName := "my-producer"
+
+	p1, err := client.CreateProducer(ProducerOptions{
+		Topic: topicName,
+		Name:  producerName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p1.Close()
+
+	_, err = client.CreateProducer(ProducerOptions{
+		Topic: topicName,
+		Name:  producerName,
+	})
+	assert.NotNil(t, err, "expected error when creating producer with same name")
+}
+
+func TestProducerMetadata(t *testing.T) {
+	client, err := NewClient(ClientOptions{
+		URL: lookupURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	topic := newTopicName()
+	props := map[string]string{
+		"key1": "value1",
+	}
+	producer, err := client.CreateProducer(ProducerOptions{
+		Topic:      topic,
+		Name:       "my-producer",
+		Properties: props,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Close()
+	stats, err := topicStats(topic)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	meta := stats["publishers"].([]interface{})[0].(map[string]interface{})["metadata"].(map[string]interface{})
+	assert.Equal(t, len(props), len(meta))
+	for k, v := range props {
+		mv := meta[k].(string)
+		assert.Equal(t, v, mv)
+	}
 }

@@ -115,9 +115,9 @@ func (c *client) Publish(batch publisher.Batch) error {
 				dropped++
 				logp.Err("produce send failed: %v", err)
 			}
+			wg.Done()
 		})
 		logp.Debug("pulsar", "Pulsar success send event: %d", i)
-		wg.Done()
 	}
 	c.producer.Flush()
 	wg.Wait()

@@ -37,5 +37,5 @@ var (
 	NoopProvider = NewNoopProvider()
 	ZLibProvider = NewZLibProvider()
 	Lz4Provider  = NewLz4Provider()
-//	ZStdProvider = NewZStdProvider()
+	ZStdProvider = NewZStdProvider()
 )

@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"net"
 	"net/url"
@@ -33,7 +34,6 @@ import (
 
 	"github.com/apache/pulsar-client-go/pkg/auth"
 	"github.com/apache/pulsar-client-go/pkg/pb"
-	"github.com/apache/pulsar-client-go/util"
 )
 
 type TLSOptions struct {
@@ -55,7 +55,8 @@ type ConnectionListener interface {
 
 // Connection is a interface of client cnx.
 type Connection interface {
-	SendRequest(requestID uint64, req *pb.BaseCommand, callback func(command *pb.BaseCommand))
+	SendRequest(requestID uint64, req *pb.BaseCommand, callback func(*pb.BaseCommand, error))
+	SendRequestNoWait(req *pb.BaseCommand)
 	WriteData(data []byte)
 	RegisterListener(id uint64, listener ConnectionListener)
 	UnregisterListener(id uint64)
@@ -65,7 +66,7 @@ type Connection interface {
 }
 
 type ConsumerHandler interface {
-	MessageReceived(response *pb.CommandMessage, headersAndPayload []byte) error
+	MessageReceived(response *pb.CommandMessage, headersAndPayload Buffer) error
 
 	// ConnectionClosed close the TCP connection.
 	ConnectionClosed()
@@ -101,9 +102,14 @@ func (s connectionState) String() string {
 const keepAliveInterval = 30 * time.Second
 
 type request struct {
-	id       uint64
+	id       *uint64
 	cmd      *pb.BaseCommand
-	callback func(command *pb.BaseCommand)
+	callback func(command *pb.BaseCommand, err error)
+}
+
+type incomingCmd struct {
+	cmd               *pb.BaseCommand
+	headersAndPayload Buffer
 }
 
 type connection struct {
@@ -116,8 +122,8 @@ type connection struct {
 	cnx          net.Conn
 
 	writeBufferLock sync.Mutex
-	writeBuffer          Buffer
-	reader               *connectionReader
+	writeBuffer     Buffer
+	reader          *connectionReader
 
 	lastDataReceivedLock sync.Mutex
 	lastDataReceivedTime time.Time
@@ -128,14 +134,14 @@ type connection struct {
 	requestIDGenerator uint64
 
 	incomingRequestsCh chan *request
+	incomingCmdCh      chan *incomingCmd
 	writeRequestsCh    chan []byte
 
-	mapMutex    sync.RWMutex
 	pendingReqs map[uint64]*request
 	listeners   map[uint64]ConnectionListener
 
 	consumerHandlersLock sync.RWMutex
-	consumerHandlers map[uint64]ConsumerHandler
+	consumerHandlers     map[uint64]ConsumerHandler
 
 	tlsOptions *TLSOptions
 	auth       auth.Provider
@@ -155,6 +161,7 @@ func newConnection(logicalAddr *url.URL, physicalAddr *url.URL, tlsOptions *TLSO
 		auth:                 auth,
 
 		incomingRequestsCh: make(chan *request),
+		incomingCmdCh:      make(chan *incomingCmd),
 		writeRequestsCh:    make(chan []byte),
 		listeners:          make(map[uint64]ConnectionListener),
 		consumerHandlers:   make(map[uint64]ConsumerHandler),
@@ -279,10 +286,10 @@ func (c *connection) run() {
 			if req == nil {
 				return
 			}
-			c.mapMutex.Lock()
-			c.pendingReqs[req.id] = req
-			c.mapMutex.Unlock()
-			c.writeCommand(req.cmd)
+			c.internalSendRequest(req)
+
+		case cmd := <-c.incomingCmdCh:
+			c.internalReceivedCommand(cmd.cmd, cmd.headersAndPayload)
 
 		case data := <-c.writeRequestsCh:
 			if data == nil {
@@ -330,10 +337,13 @@ func (c *connection) writeCommand(cmd proto.Message) {
 	c.internalWriteData(data)
 }
 
-func (c *connection) receivedCommand(cmd *pb.BaseCommand, headersAndPayload []byte) {
+func (c *connection) receivedCommand(cmd *pb.BaseCommand, headersAndPayload Buffer) {
+	c.incomingCmdCh <- &incomingCmd{cmd, headersAndPayload}
+}
+
+func (c *connection) internalReceivedCommand(cmd *pb.BaseCommand, headersAndPayload Buffer) {
 	c.log.Debugf("Received command: %s -- payload: %v", cmd, headersAndPayload)
 	c.setLastDataReceived(time.Now())
-	var err error
 
 	switch *cmd.Type {
 	case pb.BaseCommand_SUCCESS:
@@ -362,11 +372,8 @@ func (c *connection) receivedCommand(cmd *pb.BaseCommand, headersAndPayload []by
 		c.handleResponse(cmd.GetSchemaResponse.GetRequestId(), cmd)
 
 	case pb.BaseCommand_ERROR:
-		if cmd.Error != nil {
-			c.log.Errorf("Error: %s, Error Message: %s", cmd.Error.GetError(), cmd.Error.GetMessage())
-			c.Close()
-			return
-		}
+		c.handleResponseError(cmd.GetError())
+
 	case pb.BaseCommand_CLOSE_PRODUCER:
 		c.handleCloseProducer(cmd.GetCloseProducer())
 	case pb.BaseCommand_CLOSE_CONSUMER:
@@ -378,10 +385,8 @@ func (c *connection) receivedCommand(cmd *pb.BaseCommand, headersAndPayload []by
 	case pb.BaseCommand_SEND_ERROR:
 
 	case pb.BaseCommand_MESSAGE:
-		err = c.handleMessage(cmd.GetMessage(), headersAndPayload)
-		if err != nil {
-			c.Close()
-		}
+		c.handleMessage(cmd.GetMessage(), headersAndPayload)
+
 	case pb.BaseCommand_PING:
 		c.handlePing()
 	case pb.BaseCommand_PONG:
@@ -399,23 +404,30 @@ func (c *connection) Write(data []byte) {
 	c.writeRequestsCh <- data
 }
 
-func (c *connection) SendRequest(requestID uint64, req *pb.BaseCommand, callback func(command *pb.BaseCommand)) {
+func (c *connection) SendRequest(requestID uint64, req *pb.BaseCommand, callback func(command *pb.BaseCommand, err error)) {
 	c.incomingRequestsCh <- &request{
-		id:       requestID,
+		id:       &requestID,
 		cmd:      req,
 		callback: callback,
 	}
 }
 
+func (c *connection) SendRequestNoWait(req *pb.BaseCommand) {
+	c.incomingRequestsCh <- &request{
+		id:       nil,
+		cmd:      req,
+		callback: nil,
+	}
+}
+
 func (c *connection) internalSendRequest(req *request) {
-	c.mapMutex.Lock()
-	c.pendingReqs[req.id] = req
-	c.mapMutex.Unlock()
+	if req.id != nil {
+		c.pendingReqs[*req.id] = req
+	}
 	c.writeCommand(req.cmd)
 }
 
 func (c *connection) handleResponse(requestID uint64, response *pb.BaseCommand) {
-	c.mapMutex.RLock()
 	request, ok := c.pendingReqs[requestID]
 	if !ok {
 		c.log.Warnf("Received unexpected response for request %d of type %s", requestID, response.Type)
@@ -423,8 +435,22 @@ func (c *connection) handleResponse(requestID uint64, response *pb.BaseCommand) 
 	}
 
 	delete(c.pendingReqs, requestID)
-	c.mapMutex.RUnlock()
-	request.callback(response)
+	request.callback(response, nil)
+}
+
+func (c *connection) handleResponseError(serverError *pb.CommandError) {
+	requestID := serverError.GetRequestId()
+	request, ok := c.pendingReqs[requestID]
+	if !ok {
+		c.log.Warnf("Received unexpected error response for request %d of type %s",
+			requestID, serverError.GetError())
+		return
+	}
+
+	delete(c.pendingReqs, requestID)
+
+	request.callback(nil,
+		errors.New(fmt.Sprintf("server error: %s: %s", serverError.GetError(), serverError.GetMessage())))
 }
 
 func (c *connection) handleSendReceipt(response *pb.CommandSendReceipt) {
@@ -436,26 +462,24 @@ func (c *connection) handleSendReceipt(response *pb.CommandSendReceipt) {
 	}
 }
 
-func (c *connection) handleMessage(response *pb.CommandMessage, payload []byte) error {
+func (c *connection) handleMessage(response *pb.CommandMessage, payload Buffer) {
 	c.log.Debug("Got Message: ", response)
 	consumerID := response.GetConsumerId()
 	if consumer, ok := c.consumerHandler(consumerID); ok {
 		err := consumer.MessageReceived(response, payload)
 		if err != nil {
 			c.log.WithField("consumerID", consumerID).Error("handle message err: ", response.MessageId)
-			return errors.New("handler not found")
 		}
 	} else {
 		c.log.WithField("consumerID", consumerID).Warn("Got unexpected message: ", response.MessageId)
 	}
-	return nil
 }
 
 func (c *connection) lastDataReceived() time.Time {
 	c.lastDataReceivedLock.Lock()
 	defer c.lastDataReceivedLock.Unlock()
 	t := c.lastDataReceivedTime
-	return t;
+	return t
 }
 
 func (c *connection) setLastDataReceived(t time.Time) {
@@ -489,9 +513,7 @@ func (c *connection) handleCloseConsumer(closeConsumer *pb.CommandCloseConsumer)
 	c.log.Infof("Broker notification of Closed consumer: %d", closeConsumer.GetConsumerId())
 	consumerID := closeConsumer.GetConsumerId()
 	if consumer, ok := c.consumerHandler(consumerID); ok {
-		if !util.IsNil(consumer) {
-			consumer.ConnectionClosed()
-		}
+		consumer.ConnectionClosed()
 	} else {
 		c.log.WithField("consumerID", consumerID).Warnf("Consumer with ID not found while closing consumer")
 	}
@@ -544,9 +566,14 @@ func (c *connection) Close() {
 		listener.ConnectionClosed()
 	}
 
+	consumerHandlers := make(map[uint64]ConsumerHandler)
 	c.consumerHandlersLock.RLock()
-	defer c.consumerHandlersLock.RUnlock()
-	for _, handler := range c.consumerHandlers {
+	for id, handler := range c.consumerHandlers {
+		consumerHandlers[id] = handler
+	}
+	c.consumerHandlersLock.RUnlock()
+
+	for _, handler := range consumerHandlers {
 		handler.ConnectionClosed()
 	}
 }

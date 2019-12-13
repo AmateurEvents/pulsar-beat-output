@@ -153,7 +153,9 @@ func (bb *BatchBuilder) Flush() (batchData []byte, sequenceID uint64, callbacks 
 	bb.msgMetadata.NumMessagesInBatch = proto.Int32(int32(bb.numMessages))
 	bb.cmdSend.Send.NumMessages = proto.Int32(int32(bb.numMessages))
 
+	uncompressedSize := bb.buffer.ReadableBytes()
 	compressed := bb.compressionProvider.Compress(bb.buffer.ReadableSlice())
+	bb.msgMetadata.UncompressedSize = &uncompressedSize
 
 	buffer := NewBuffer(4096)
 	serializeBatch(buffer, bb.cmdSend, bb.msgMetadata, compressed)
@@ -172,8 +174,8 @@ func getCompressionProvider(compressionType pb.CompressionType) compression.Prov
 		return compression.Lz4Provider
 	case pb.CompressionType_ZLIB:
 		return compression.ZLibProvider
-	//case pb.CompressionType_ZSTD:
-	//	return compression.ZStdProvider
+	case pb.CompressionType_ZSTD:
+		return compression.ZStdProvider
 	default:
 		log.Panic("unsupported compression type")
 		return nil
