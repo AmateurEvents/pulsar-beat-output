@@ -154,7 +154,7 @@ func initOptions(
 	if config.CompressionType > 0 {
 		producerOptions.CompressionType = config.CompressionType
 	}
-	if config.Batching {
+	if !config.Batching {
 		producerOptions.DisableBatching = !config.Batching
 	}
 	if config.BatchingTimeMillis > 0 {
